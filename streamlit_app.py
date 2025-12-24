@@ -11,7 +11,7 @@ st.set_page_config(page_title="OECS — Lusaka (Cloud)", page_icon="🧠", layou
 try:
     # Attempt to load from Streamlit Secrets (Cloud)
     api_key = st.secrets["GEMINI_API_KEY"]
-    # Updated default to Gemini 3 Flash
+    # Default to Gemini 3 Flash
     model_name = st.secrets.get("GEMINI_MODEL", "gemini-3-flash-preview")
     
     genai.configure(api_key=api_key)
@@ -78,7 +78,7 @@ def generate_response(user_input):
     for msg in st.session_state.history:
         gemini_history.append({"role": msg["role"], "parts": msg["parts"]})
     
-    # Gemini 3 handles history well, but we pass current prompt in history for consistency
+    # Pass current prompt
     gemini_history.append({"role": "user", "parts": [user_input]})
 
     try:
@@ -121,10 +121,11 @@ with st.sidebar:
             del st.session_state[key]
         st.rerun()
     
+    # Sidebar Renewal Button
     if st.session_state.step == "active":
         if st.button("Renew Budget"):
             st.session_state.risk_budget = {k: 10 for k in st.session_state.risk_budget}
-            st.success("Budget Replenished.")
+            st.session_state.messages.append({"role": "assistant", "content": "ADMIN: Risk Budget Replenished (Sidebar)."})
             st.rerun()
 
     st.write("---")
@@ -138,7 +139,7 @@ with st.sidebar:
 st.markdown("<h1 style='text-align: center;'>🧠 OECS Cloud</h1>", unsafe_allow_html=True)
 st.caption("Open Epistemic Co-Creation System | Lusaka, Zambia 🇿🇲")
 
-# STATE MACHINE
+# STATE MACHINE UI
 if st.session_state.step == "mode_selection":
     st.info("Select Epistemic Mode to begin:")
     options = ["DIAGNOSTIC", "OPEN_EPISTEMIC", "CO_CREATION", "SIMULATION", "CONSENSUS_SAFE"]
@@ -151,21 +152,23 @@ if st.session_state.step == "mode_selection":
 
 elif st.session_state.step == "active":
     if any(v <= 0 for v in st.session_state.risk_budget.values()):
-        st.error("Risk Budget Depleted. Please Renew in Sidebar.")
+        st.warning("Risk Budget Depleted. Type 'RENEW' or use Sidebar.")
 
-# DISPLAY
+# DISPLAY CHAT HISTORY
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# INPUT
+# INPUT HANDLER
 if prompt := st.chat_input("Input..."):
+    # Add User Message to UI
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     response = ""
     
+    # Contract Logic
     if st.session_state.step == "contract":
         expected = f"ACCEPT {st.session_state.mode}"
         if prompt.upper().strip() == expected:
@@ -174,6 +177,7 @@ if prompt := st.chat_input("Input..."):
         else:
             response = f"Please type exactly: {expected}"
 
+    # Budget Logic (Initial Setup)
     elif st.session_state.step == "risk_budget":
         matches = re.findall(r"\d+:\s*(\d+)", prompt)
         if len(matches) == 4:
@@ -185,12 +189,30 @@ if prompt := st.chat_input("Input..."):
         else:
             response = "Invalid format. Try: '1:10 2:10 3:10 4:10'"
 
+    # Active Session Logic
     elif st.session_state.step == "active":
-        if any(v <= 0 for v in st.session_state.risk_budget.values()):
-            response = "Budget Depleted. Renew required."
+        
+        # --- NEW: RENEW COMMAND LOGIC ---
+        # 1. Simple Command "RENEW"
+        if prompt.strip().upper() == "RENEW":
+             st.session_state.risk_budget = {k: 10 for k in st.session_state.risk_budget}
+             response = "ADMIN: Risk Budget Replenished to 10/10."
+        
+        # 2. Re-parsing "1:10..." string during session to reset specific amounts
+        elif re.search(r"1:\s*\d+", prompt) and len(re.findall(r"\d+:\s*\d+", prompt)) == 4:
+            matches = re.findall(r"\d+:\s*(\d+)", prompt)
+            vals = [int(v) for v in matches]
+            keys = ["epistemic_uncertainty", "metaphysical_abstraction", "non_consensus_reasoning", "paradox_exposure"]
+            st.session_state.risk_budget = dict(zip(keys, vals))
+            response = f"ADMIN: Risk Budget updated manually: {st.session_state.risk_budget}"
+
+        # 3. Standard Logic
+        elif any(v <= 0 for v in st.session_state.risk_budget.values()):
+            response = "Budget Depleted. Type 'RENEW' to continue."
         else:
             with st.spinner(f"Processing ({model_name})..."):
                 response = generate_response(prompt)
     
+    # Add AI Response to UI
     st.session_state.messages.append({"role": "assistant", "content": response})
     st.rerun()
