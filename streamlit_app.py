@@ -64,19 +64,22 @@ def clear_db():
 
 init_db()
 
-# --- SESSION ID LOGIC ---
-# If user clicked a history button, update ID
+# --- SESSION ID LOGIC (URL LOCK) ---
+# 1. Handle Sidebar Navigation
 if "target_session" in st.session_state:
     st.query_params["session_id"] = st.session_state.target_session
     del st.session_state.target_session
+    st.rerun() # Force reload to apply the ID
 
-# Get ID from URL or generate new
-if "session_id" not in st.query_params:
+# 2. Get ID from URL
+if "session_id" in st.query_params:
+    st.session_state.session_id = st.query_params["session_id"]
+else:
+    # 3. Generate New ID & FORCE URL UPDATE
     new_id = str(uuid.uuid4())[:8]
     st.query_params["session_id"] = new_id
     st.session_state.session_id = new_id
-else:
-    st.session_state.session_id = st.query_params["session_id"]
+    st.rerun() # <--- CRITICAL: Locks the ID into the browser URL bar
 
 # --- STATE RESTORATION ---
 # Logic: Always try to load from DB first to sync state
