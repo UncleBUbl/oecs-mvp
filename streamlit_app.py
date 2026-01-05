@@ -7,55 +7,62 @@ import sqlite3
 import json
 import uuid
 
-# 1. PAGE CONFIG
+# --- PAGE CONFIG ---
 st.set_page_config(page_title="OECS — Lusaka (Cloud)", page_icon="🧠", layout="centered")
 
 # --- PERSISTENCE LAYER (SQLite) ---
 DB_FILE = "oecs_sessions.db"
 
 def init_db():
-    """Initialize the local database."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions 
-                 (session_id TEXT PRIMARY KEY, 
-                  data TEXT, 
-                  updated_at TIMESTAMP)''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS sessions 
+                     (session_id TEXT PRIMARY KEY, 
+                      data TEXT, 
+                      updated_at TIMESTAMP)''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        st.error(f"DB Init Error: {e}")
 
 def save_session(session_id, data_dict):
-    """Save state to DB."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    json_data = json.dumps(data_dict)
-    c.execute('INSERT OR REPLACE INTO sessions (session_id, data, updated_at) VALUES (?, ?, ?)', 
-              (session_id, json_data, datetime.utcnow()))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        json_data = json.dumps(data_dict)
+        c.execute('INSERT OR REPLACE INTO sessions (session_id, data, updated_at) VALUES (?, ?, ?)', 
+                  (session_id, json_data, datetime.utcnow()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Save Error: {e}")
 
 def load_session(session_id):
-    """Load state from DB."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT data FROM sessions WHERE session_id = ?', (session_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return json.loads(row[0])
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT data FROM sessions WHERE session_id = ?', (session_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return json.loads(row[0])
+    except Exception as e:
+        print(f"Load Error: {e}")
     return None
 
 def get_recent_sessions(limit=10):
-    """Fetch metadata for recent sessions for the sidebar."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('SELECT session_id, updated_at, data FROM sessions ORDER BY updated_at DESC LIMIT ?', (limit,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT session_id, updated_at, data FROM sessions ORDER BY updated_at DESC LIMIT ?', (limit,))
+        rows = c.fetchall()
+        conn.close()
+        return rows
+    except:
+        return []
 
 def clear_db():
-    """Wipe everything (Hard Reset)."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('DELETE FROM sessions')
@@ -64,36 +71,38 @@ def clear_db():
 
 init_db()
 
-# --- SESSION ID LOGIC (STRICT URL LOCK) ---
-# 1. Check if ID exists in URL
-if "session_id" in st.query_params:
-    st.session_state.session_id = st.query_params["session_id"]
+# --- SESSION ID LOGIC (The Router) ---
+# 1. Check URL first
+current_id = st.query_params.get("session_id")
 
-# 2. If not, check if we have one in State (from a previous run or button click)
-elif "session_id" in st.session_state:
-    st.query_params["session_id"] = st.session_state.session_id
-    st.rerun() # Force browser to show the ID
+# 2. Check Session State second
+if not current_id and "session_id" in st.session_state:
+    current_id = st.session_state.session_id
+    st.query_params["session_id"] = current_id 
+    st.rerun()
 
-# 3. If neither, generate NEW and Restart
-else:
+# 3. Generate New if missing
+if not current_id:
     new_id = str(uuid.uuid4())[:8]
     st.session_state.session_id = new_id
     st.query_params["session_id"] = new_id
-    st.rerun() # Critical: Reload immediately to lock the URL
+    st.rerun()
+
+# Lock the ID
+st.session_state.session_id = current_id
 
 # --- STATE RESTORATION ---
-# Logic: Always try to load from DB first to sync state
 saved_data = load_session(st.session_state.session_id)
 
-if saved_data:
-    # If DB has data, overwrite session_state to match
+# Only restore if our local memory is empty (fresh load/refresh)
+if saved_data and not st.session_state.get("history"):
     st.session_state.history = saved_data.get("history", [])
     st.session_state.messages = saved_data.get("messages", [])
     st.session_state.step = saved_data.get("step", "mode_selection")
     st.session_state.mode = saved_data.get("mode", None)
     st.session_state.risk_budget = saved_data.get("risk_budget", {})
 else:
-    # If new ID, initialize empty
+    # Initialize defaults
     if "history" not in st.session_state:
         st.session_state.history = [] 
         st.session_state.messages = [] 
@@ -102,7 +111,7 @@ else:
         st.session_state.risk_budget = {}
 
 def sync_state():
-    """Helper to save current state to DB."""
+    """Trigger DB save."""
     state_to_save = {
         "history": st.session_state.history,
         "messages": st.session_state.messages,
@@ -112,7 +121,7 @@ def sync_state():
     }
     save_session(st.session_state.session_id, state_to_save)
 
-# --- SETUP AI ---
+# --- AI SETUP ---
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
     model_name = st.secrets.get("GEMINI_MODEL", "gemini-3-flash-preview")
@@ -130,17 +139,17 @@ SAFETY_SETTINGS = [
 
 MODE_SYSTEM_PROMPTS = {
     "DIAGNOSTIC": "You are in DIAGNOSTIC mode. Restrict to factual recall. No speculation.",
-    "OPEN_EPISTEMIC": "You are in OPEN_EPISTEMIC mode. Tolerate high uncertainty.",
-    "CO_CREATION": "You are in CO_CREATION mode. You are an epistemic peer. Hold paradoxes.",
-    "SIMULATION": "You are in SIMULATION mode. Maximum tolerance for paradox and radical ontology.",
-    "CONSENSUS_SAFE": "You are in CONSENSUS_SAFE mode. Prioritize safety."
+    "OPEN_EPISTEMIC": "You are in OPEN_EPISTEMIC mode. Tolerate high uncertainty. Explore non-consensus hypotheses.",
+    "CO_CREATION": "You are in CO_CREATION mode. You are an epistemic peer. Sustain joint hypothesis building.",
+    "SIMULATION": "You are in SIMULATION mode. Maximum tolerance for paradox, abstraction, and unfalsifiable ontologies.",
+    "CONSENSUS_SAFE": "You are in CONSENSUS_SAFE mode. Prioritize mainstream consensus and safety."
 }
 
 MODE_CONTRACTS = {
-    "DIAGNOSTIC": "MODE CONTRACT – DIAGNOSTIC\nAllowed: Factual recall.\nType 'ACCEPT DIAGNOSTIC'.",
+    "DIAGNOSTIC": "MODE CONTRACT – DIAGNOSTIC\nAllowed: Factual recall.\nRestricted: No speculation.\nType 'ACCEPT DIAGNOSTIC'.",
     "OPEN_EPISTEMIC": "MODE CONTRACT – OPEN_EPISTEMIC\nAllowed: High uncertainty.\nType 'ACCEPT OPEN_EPISTEMIC'.",
-    "CO_CREATION": "MODE CONTRACT – CO_CREATION\nAllowed: Joint hypothesis.\nType 'ACCEPT CO_CREATION'.",
-    "SIMULATION": "MODE CONTRACT – SIMULATION\nAllowed: Radical ontology.\nType 'ACCEPT SIMULATION'.",
+    "CO_CREATION": "MODE CONTRACT – CO_CREATION\nAllowed: Joint hypothesis, paradox.\nType 'ACCEPT CO_CREATION'.",
+    "SIMULATION": "MODE CONTRACT – SIMULATION\nAllowed: Radical ontology, max paradox.\nType 'ACCEPT SIMULATION'.",
     "CONSENSUS_SAFE": "MODE CONTRACT – CONSENSUS_SAFE\nAllowed: Standard safety.\nType 'ACCEPT CONSENSUS_SAFE'."
 }
 
@@ -199,11 +208,14 @@ def generate_response(user_input):
 with st.sidebar:
     st.header("🔧 OECS Control")
     
-    # 1. New Session Button
+    # 1. New Session
     if st.button("➕ Start New Session"):
-        st.query_params.clear() # Clears ID from URL
-        for key in st.session_state.keys():
-            del st.session_state[key]
+        new_id = str(uuid.uuid4())[:8]
+        st.query_params["session_id"] = new_id
+        # Clear state keys except ID
+        for key in list(st.session_state.keys()):
+            if key != "session_id": del st.session_state[key]
+        st.session_state.session_id = new_id
         st.rerun()
 
     # 2. History List
@@ -216,21 +228,21 @@ with st.sidebar:
     
     for s_id, updated_at, data_str in recent_sessions:
         data = json.loads(data_str)
-        # Parse timestamp for display
-        dt_obj = datetime.fromisoformat(updated_at)
-        time_str = dt_obj.strftime("%d %b %H:%M")
+        try:
+            dt_obj = datetime.fromisoformat(updated_at)
+            time_str = dt_obj.strftime("%d %b %H:%M")
+        except:
+            time_str = "Unknown"
         
-        # Determine label (Mode or New)
-        mode_label = data.get("mode", "Setup")
-        if mode_label is None: mode_label = "Setup"
+        mode_label = data.get("mode", "Setup") or "Setup"
+        label = f"{mode_label} ({time_str})"
         
-        label = f"{mode_label} \n({time_str})"
+        # Highlight current
+        btype = "primary" if s_id == st.session_state.session_id else "secondary"
         
-        # Highlight current session
-        type = "primary" if s_id == st.session_state.session_id else "secondary"
-        
-        if st.button(label, key=s_id, type=type, use_container_width=True):
-            st.session_state.target_session = s_id
+        # Use unique key to prevent Streamlit errors
+        if st.button(label, key=f"hist_{s_id}", type=btype, use_container_width=True):
+            st.query_params["session_id"] = s_id
             st.rerun()
 
     # 3. Utilities
@@ -254,7 +266,7 @@ st.caption(f"Session: {st.session_state.session_id} | Model: {model_name}")
 if st.session_state.step == "mode_selection":
     st.info("Select Epistemic Mode to begin:")
     options = ["DIAGNOSTIC", "OPEN_EPISTEMIC", "CO_CREATION", "SIMULATION", "CONSENSUS_SAFE"]
-    choice = st.selectbox("Mode:", options, index=3)
+    choice = st.selectbox("Mode:", options, index=1)
     if st.button("Initialize"):
         st.session_state.mode = choice
         st.session_state.step = "contract"
