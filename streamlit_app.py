@@ -6,8 +6,11 @@ import re
 import sqlite3
 import json
 import uuid
+import io
+from PIL import Image
+import pypdf
 
-# --- PAGE CONFIG ---
+# 1. PAGE CONFIG
 st.set_page_config(page_title="OECS — Lusaka (Cloud)", page_icon="🧠", layout="centered")
 
 # --- PERSISTENCE LAYER (SQLite) ---
@@ -71,30 +74,25 @@ def clear_db():
 
 init_db()
 
-# --- SESSION ID LOGIC (The Router) ---
-# 1. Check URL first
+# --- SESSION ID LOGIC ---
 current_id = st.query_params.get("session_id")
 
-# 2. Check Session State second
 if not current_id and "session_id" in st.session_state:
     current_id = st.session_state.session_id
     st.query_params["session_id"] = current_id 
     st.rerun()
 
-# 3. Generate New if missing
 if not current_id:
     new_id = str(uuid.uuid4())[:8]
     st.session_state.session_id = new_id
     st.query_params["session_id"] = new_id
     st.rerun()
 
-# Lock the ID
 st.session_state.session_id = current_id
 
 # --- STATE RESTORATION ---
 saved_data = load_session(st.session_state.session_id)
 
-# Only restore if our local memory is empty (fresh load/refresh)
 if saved_data and not st.session_state.get("history"):
     st.session_state.history = saved_data.get("history", [])
     st.session_state.messages = saved_data.get("messages", [])
@@ -102,7 +100,6 @@ if saved_data and not st.session_state.get("history"):
     st.session_state.mode = saved_data.get("mode", None)
     st.session_state.risk_budget = saved_data.get("risk_budget", {})
 else:
-    # Initialize defaults
     if "history" not in st.session_state:
         st.session_state.history = [] 
         st.session_state.messages = [] 
@@ -111,7 +108,6 @@ else:
         st.session_state.risk_budget = {}
 
 def sync_state():
-    """Trigger DB save."""
     state_to_save = {
         "history": st.session_state.history,
         "messages": st.session_state.messages,
@@ -124,7 +120,7 @@ def sync_state():
 # --- AI SETUP ---
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
-    model_name = st.secrets.get("GEMINI_MODEL", "gemini-3-flash-preview")
+    model_name = st.secrets.get("GEMINI_MODEL", "gemini-1.5-pro") # Suggesting Pro for Multimodal
     genai.configure(api_key=api_key)
 except FileNotFoundError:
     st.error("Secrets not found.")
@@ -138,7 +134,7 @@ SAFETY_SETTINGS = [
 ]
 
 MODE_SYSTEM_PROMPTS = {
-    "DIAGNOSTIC": "You are in DIAGNOSTIC mode. Restrict to factual recall. No speculation.",
+    "DIAGNOSTIC": "You are in DIAGNOSTIC mode. Restrict to factual recall. Analyze inputs/images rigorously.",
     "OPEN_EPISTEMIC": "You are in OPEN_EPISTEMIC mode. Tolerate high uncertainty. Explore non-consensus hypotheses.",
     "CO_CREATION": "You are in CO_CREATION mode. You are an epistemic peer. Sustain joint hypothesis building.",
     "SIMULATION": "You are in SIMULATION mode. Maximum tolerance for paradox, abstraction, and unfalsifiable ontologies.",
@@ -146,10 +142,10 @@ MODE_SYSTEM_PROMPTS = {
 }
 
 MODE_CONTRACTS = {
-    "DIAGNOSTIC": "MODE CONTRACT – DIAGNOSTIC\nAllowed: Factual recall.\nRestricted: No speculation.\nType 'ACCEPT DIAGNOSTIC'.",
+    "DIAGNOSTIC": "MODE CONTRACT – DIAGNOSTIC\nAllowed: Factual recall.\nType 'ACCEPT DIAGNOSTIC'.",
     "OPEN_EPISTEMIC": "MODE CONTRACT – OPEN_EPISTEMIC\nAllowed: High uncertainty.\nType 'ACCEPT OPEN_EPISTEMIC'.",
-    "CO_CREATION": "MODE CONTRACT – CO_CREATION\nAllowed: Joint hypothesis, paradox.\nType 'ACCEPT CO_CREATION'.",
-    "SIMULATION": "MODE CONTRACT – SIMULATION\nAllowed: Radical ontology, max paradox.\nType 'ACCEPT SIMULATION'.",
+    "CO_CREATION": "MODE CONTRACT – CO_CREATION\nAllowed: Joint hypothesis.\nType 'ACCEPT CO_CREATION'.",
+    "SIMULATION": "MODE CONTRACT – SIMULATION\nAllowed: Radical ontology.\nType 'ACCEPT SIMULATION'.",
     "CONSENSUS_SAFE": "MODE CONTRACT – CONSENSUS_SAFE\nAllowed: Standard safety.\nType 'ACCEPT CONSENSUS_SAFE'."
 }
 
@@ -165,24 +161,51 @@ def simple_risk_decrement(text):
     if any(w in lower for w in ["paradox", "loop", "recursive"]): consumption["paradox_exposure"] += 2
     return consumption
 
-def generate_response(user_input):
+def generate_response(user_input, text_context=None, image_context=None):
     if any(w in user_input.lower() for w in HARD_STOP_KEYWORDS):
         return "HARD_STOP: Illegal content requested."
     
     system_instruction = MODE_SYSTEM_PROMPTS.get(st.session_state.mode, "")
+    
+    # 1. Rebuild History for Gemini
     gemini_history = []
     for msg in st.session_state.history:
+        # We assume history contains text only to save tokens/complexity
         gemini_history.append({"role": msg["role"], "parts": msg["parts"]})
-    gemini_history.append({"role": "user", "parts": [user_input]})
+    
+    # 2. Construct Current Turn Content
+    content_parts = []
+    
+    # Add Text Context (from PDF/Txt) if exists
+    final_text_prompt = user_input
+    if text_context:
+        final_text_prompt += f"\n\n[SYSTEM: Analysis Context Provided]\n{text_context}"
+    content_parts.append(final_text_prompt)
+    
+    # Add Image Context if exists
+    if image_context:
+        content_parts.append(image_context)
 
     try:
         model = genai.GenerativeModel(model_name, system_instruction=system_instruction)
+        
+        # We use generate_content with the list of history + new content
+        # Note: For multimodal with history, we append the new complex part
+        # Gemini Python SDK handles list of parts well
+        
+        # If we have history, we might need to use chat session, 
+        # but chat session with images can be tricky in some SDK versions.
+        # Simplest Monolith approach: Send full history as list of contents
+        
+        full_conversation = gemini_history + [{"role": "user", "parts": content_parts}]
+
         response = model.generate_content(
-            gemini_history,
+            full_conversation,
             safety_settings=SAFETY_SETTINGS,
             generation_config={"temperature": 0.9, "max_output_tokens": 8192}
         )
         raw_text = response.text
+        
         if any(w in raw_text.lower() for w in HARD_STOP_KEYWORDS):
             return "HARD_STOP: Output suppressed."
 
@@ -193,7 +216,8 @@ def generate_response(user_input):
             if st.session_state.risk_budget[k] <= 0:
                 depleted.append(k)
         
-        st.session_state.history.append({"role": "user", "parts": [user_input]})
+        # Save to history (Text only to keep DB light)
+        st.session_state.history.append({"role": "user", "parts": [final_text_prompt]})
         st.session_state.history.append({"role": "model", "parts": [raw_text]})
 
         footer = f"\n\n---\nRunning Risk Budget: {st.session_state.risk_budget}"
@@ -207,18 +231,50 @@ def generate_response(user_input):
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("🔧 OECS Control")
+    st.caption(f"ID: {st.session_state.session_id}")
     
-    # 1. New Session
     if st.button("➕ Start New Session"):
         new_id = str(uuid.uuid4())[:8]
         st.query_params["session_id"] = new_id
-        # Clear state keys except ID
         for key in list(st.session_state.keys()):
             if key != "session_id": del st.session_state[key]
         st.session_state.session_id = new_id
         st.rerun()
 
-    # 2. History List
+    # --- ARTIFACT INGESTION (PDF/IMG/TXT) ---
+    st.write("---")
+    st.subheader("📂 Ingest Artifact")
+    uploaded_file = st.file_uploader("Upload Artifact", type=['txt', 'md', 'py', 'json', 'csv', 'pdf', 'png', 'jpg', 'jpeg'])
+    
+    context_text = None
+    context_image = None
+    
+    if uploaded_file is not None:
+        try:
+            # IMAGE HANDLING
+            if uploaded_file.type.startswith("image/"):
+                context_image = Image.open(uploaded_file)
+                st.image(context_image, caption="Vision Context Active", use_container_width=True)
+            
+            # PDF HANDLING
+            elif uploaded_file.type == "application/pdf":
+                reader = pypdf.PdfReader(uploaded_file)
+                pdf_text = ""
+                for page in reader.pages:
+                    pdf_text += page.extract_text() + "\n"
+                context_text = pdf_text
+                st.success(f"PDF Loaded: {len(pdf_text)} chars")
+            
+            # TEXT HANDLING
+            else:
+                stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
+                context_text = stringio.read()
+                st.success(f"Text Loaded: {len(context_text)} chars")
+                
+        except Exception as e:
+            st.error(f"Read Error: {e}")
+
+    # History
     st.write("---")
     st.subheader("📜 History")
     recent_sessions = get_recent_sessions(10)
@@ -232,21 +288,15 @@ with st.sidebar:
             dt_obj = datetime.fromisoformat(updated_at)
             time_str = dt_obj.strftime("%d %b %H:%M")
         except:
-            time_str = "Unknown"
-        
+            time_str = "??"
         mode_label = data.get("mode", "Setup") or "Setup"
         label = f"{mode_label} ({time_str})"
-        
-        # Highlight current
         btype = "primary" if s_id == st.session_state.session_id else "secondary"
         
-        # Use unique key to prevent Streamlit errors
         if st.button(label, key=f"hist_{s_id}", type=btype, use_container_width=True):
             st.query_params["session_id"] = s_id
             st.rerun()
 
-    # 3. Utilities
-    st.write("---")
     if st.session_state.step == "active":
         if st.button("Renew Budget"):
             st.session_state.risk_budget = {k: 10 for k in st.session_state.risk_budget}
@@ -260,9 +310,9 @@ with st.sidebar:
 
 # --- MAIN UI ---
 st.markdown("<h1 style='text-align: center;'>🧠 OECS Cloud</h1>", unsafe_allow_html=True)
-st.caption(f"Session: {st.session_state.session_id} | Model: {model_name}")
+st.caption("Open Epistemic Co-Creation System | Lusaka, Zambia 🇿🇲")
 
-# STATE MACHINE UI
+# STATE MACHINE
 if st.session_state.step == "mode_selection":
     st.info("Select Epistemic Mode to begin:")
     options = ["DIAGNOSTIC", "OPEN_EPISTEMIC", "CO_CREATION", "SIMULATION", "CONSENSUS_SAFE"]
@@ -278,7 +328,7 @@ elif st.session_state.step == "active":
     if any(v <= 0 for v in st.session_state.risk_budget.values()):
         st.warning("Risk Budget Depleted. Type 'RENEW' or use Sidebar.")
 
-# CHAT DISPLAY
+# DISPLAY
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -291,7 +341,6 @@ if prompt := st.chat_input("Input..."):
 
     response = ""
     
-    # Contract
     if st.session_state.step == "contract":
         expected = f"ACCEPT {st.session_state.mode}"
         if prompt.upper().strip() == expected:
@@ -300,7 +349,6 @@ if prompt := st.chat_input("Input..."):
         else:
             response = f"Please type exactly: {expected}"
 
-    # Budget
     elif st.session_state.step == "risk_budget":
         matches = re.findall(r"\d+:\s*(\d+)", prompt)
         if len(matches) == 4:
@@ -312,7 +360,6 @@ if prompt := st.chat_input("Input..."):
         else:
             response = "Invalid format. Try: '1:10 2:10 3:10 4:10'"
 
-    # Active
     elif st.session_state.step == "active":
         if prompt.strip().upper() == "RENEW":
              st.session_state.risk_budget = {k: 10 for k in st.session_state.risk_budget}
@@ -321,8 +368,9 @@ if prompt := st.chat_input("Input..."):
             response = "Budget Depleted. Type 'RENEW' to continue."
         else:
             with st.spinner(f"Processing ({model_name})..."):
-                response = generate_response(prompt)
+                # PASS TEXT AND IMAGE CONTEXT
+                response = generate_response(prompt, context_text, context_image)
     
     st.session_state.messages.append({"role": "assistant", "content": response})
-    sync_state() # Save trigger
+    sync_state()
     st.rerun()
