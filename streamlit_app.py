@@ -9,7 +9,7 @@ import uuid
 import io
 from PIL import Image
 import pypdf
-from gtts import gTTS # NEW: Text-to-Speech
+from gtts import gTTS
 
 # 1. PAGE CONFIG
 st.set_page_config(page_title="OECS — Lusaka (Cloud)", page_icon="🧠", layout="centered")
@@ -176,7 +176,7 @@ def generate_response(user_input, text_context=None, image_context=None, audio_c
     # 2. Construct Current Content
     content_parts = []
     
-    # Text Input (might be empty if audio only)
+    # Text Input
     if user_input:
         final_text_prompt = user_input
         if text_context:
@@ -210,17 +210,16 @@ def generate_response(user_input, text_context=None, image_context=None, audio_c
             if st.session_state.risk_budget[k] <= 0:
                 depleted.append(k)
         
-        # Save History (If audio, we just save a placeholder text to avoid huge DB)
+        # Save History
         user_log = user_input if user_input else "[Audio Input]"
         st.session_state.history.append({"role": "user", "parts": [user_log]})
         st.session_state.history.append({"role": "model", "parts": [raw_text]})
 
         footer = f"\n\n---\nRunning Risk Budget: {st.session_state.risk_budget}"
         
-        # --- TTS GENERATION (Voice Output) ---
-        # Generate audio for the response
+        # TTS GENERATION
         try:
-            tts = gTTS(text=raw_text[:500], lang='en') # Limit to 500 chars for speed
+            tts = gTTS(text=raw_text[:500], lang='en')
             tts_fp = io.BytesIO()
             tts.write_to_fp(tts_fp)
             st.session_state.last_audio = tts_fp
@@ -262,7 +261,8 @@ with st.sidebar:
                 st.image(context_image, caption="Vision Active", use_container_width=True)
             elif uploaded_file.type == "application/pdf":
                 reader = pypdf.PdfReader(uploaded_file)
-                context_text = "".join([p.extract_text() for p in reader.pages[:50]]) # Limit 50 pages
+                # Limit pages to prevent crash
+                context_text = "".join([p.extract_text() for p in reader.pages[:50]])
                 st.success(f"PDF Loaded.")
             else:
                 stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
@@ -271,7 +271,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Error: {e}")
 
-    # History & Utils
+    # History
     st.write("---")
     st.subheader("📜 History")
     recent_sessions = get_recent_sessions(5)
@@ -289,6 +289,9 @@ with st.sidebar:
 # --- MAIN UI ---
 st.markdown("<h1 style='text-align: center;'>🧠 OECS Cloud</h1>", unsafe_allow_html=True)
 
+# Initialize audio_val safely
+audio_val = None
+
 # STATE MACHINE
 if st.session_state.step == "mode_selection":
     st.info("Select Epistemic Mode:")
@@ -302,7 +305,7 @@ if st.session_state.step == "mode_selection":
         st.rerun()
 
 elif st.session_state.step == "active":
-    # --- VOICE INPUT UI ---
+    # Show mic only in active mode
     audio_val = st.audio_input("🎤 Voice Command")
 
 # DISPLAY CHAT
@@ -310,15 +313,14 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# AUDIO OUTPUT PLAYBACK (If just generated)
+# AUDIO PLAYBACK
 if "last_audio" in st.session_state and st.session_state.last_audio:
     st.audio(st.session_state.last_audio, format="audio/mp3", autoplay=True)
-    del st.session_state.last_audio # Play once
+    del st.session_state.last_audio 
 
-# INPUT HANDLING (Text OR Audio)
+# INPUT HANDLING
 prompt = st.chat_input("Input...")
 
-# Trigger processing if Text Prompt OR Audio Input exists
 if prompt or audio_val:
     user_content = prompt if prompt else "[Audio Message]"
     st.session_state.messages.append({"role": "user", "content": user_content})
@@ -330,7 +332,6 @@ if prompt or audio_val:
 
     # Logic Handlers...
     if st.session_state.step == "contract":
-        # (Contract logic same as before - requires text)
         if prompt and "ACCEPT" in prompt.upper():
             st.session_state.step = "risk_budget"
             response = "Allocated Budget (0-10).\nFormat: 1:10, 2:10, 3:10, 4:10"
@@ -338,7 +339,6 @@ if prompt or audio_val:
             response = "Please type ACCEPT [MODE]"
 
     elif st.session_state.step == "risk_budget":
-        # (Budget logic same as before)
         if prompt:
             matches = re.findall(r"\d+:\s*(\d+)", prompt)
             if len(matches) == 4:
@@ -358,7 +358,6 @@ if prompt or audio_val:
             response = "Budget Depleted. Type 'RENEW'."
         else:
             with st.spinner("Processing..."):
-                # PASS ALL CONTEXTS
                 response = generate_response(prompt, context_text, context_image, audio_bytes)
     
     st.session_state.messages.append({"role": "assistant", "content": response})
