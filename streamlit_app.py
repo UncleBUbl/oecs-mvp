@@ -9,7 +9,6 @@ import uuid
 import io
 from PIL import Image
 import pypdf
-from gtts import gTTS
 
 # 1. PAGE CONFIG
 st.set_page_config(page_title="OECS — Lusaka (Cloud)", page_icon="🧠", layout="centered")
@@ -121,7 +120,7 @@ def sync_state():
 # --- AI SETUP ---
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
-    model_name = st.secrets.get("GEMINI_MODEL", "gemini-1.5-pro") 
+    model_name = st.secrets.get("GEMINI_MODEL", "gemini-1.5-pro") # Suggesting Pro for Multimodal
     genai.configure(api_key=api_key)
 except FileNotFoundError:
     st.error("Secrets not found.")
@@ -135,7 +134,7 @@ SAFETY_SETTINGS = [
 ]
 
 MODE_SYSTEM_PROMPTS = {
-    "DIAGNOSTIC": "You are in DIAGNOSTIC mode. Restrict to factual recall. No speculation. Analyze inputs/images rigorously.",
+    "DIAGNOSTIC": "You are in DIAGNOSTIC mode. Restrict to factual recall. Analyze inputs/images rigorously.",
     "OPEN_EPISTEMIC": "You are in OPEN_EPISTEMIC mode. Tolerate high uncertainty. Explore non-consensus hypotheses.",
     "CO_CREATION": "You are in CO_CREATION mode. You are an epistemic peer. Sustain joint hypothesis building.",
     "SIMULATION": "You are in SIMULATION mode. Maximum tolerance for paradox, abstraction, and unfalsifiable ontologies.",
@@ -162,35 +161,42 @@ def simple_risk_decrement(text):
     if any(w in lower for w in ["paradox", "loop", "recursive"]): consumption["paradox_exposure"] += 2
     return consumption
 
-def generate_response(user_input, text_context=None, image_context=None, audio_context=None):
-    if user_input and any(w in user_input.lower() for w in HARD_STOP_KEYWORDS):
+def generate_response(user_input, text_context=None, image_context=None):
+    if any(w in user_input.lower() for w in HARD_STOP_KEYWORDS):
         return "HARD_STOP: Illegal content requested."
     
     system_instruction = MODE_SYSTEM_PROMPTS.get(st.session_state.mode, "")
     
-    # 1. Rebuild History
+    # 1. Rebuild History for Gemini
     gemini_history = []
     for msg in st.session_state.history:
+        # We assume history contains text only to save tokens/complexity
         gemini_history.append({"role": msg["role"], "parts": msg["parts"]})
     
-    # 2. Construct Current Content
+    # 2. Construct Current Turn Content
     content_parts = []
     
-    # Text Input
-    if user_input:
-        final_text_prompt = user_input
-        if text_context:
-            final_text_prompt += f"\n\n[Context]\n{text_context}"
-        content_parts.append(final_text_prompt)
-    elif audio_context:
-        content_parts.append("Listen to this audio and respond appropriately.")
+    # Add Text Context (from PDF/Txt) if exists
+    final_text_prompt = user_input
+    if text_context:
+        final_text_prompt += f"\n\n[SYSTEM: Analysis Context Provided]\n{text_context}"
+    content_parts.append(final_text_prompt)
     
-    # Media Attachments
-    if image_context: content_parts.append(image_context)
-    if audio_context: content_parts.append({"mime_type": "audio/wav", "data": audio_context})
+    # Add Image Context if exists
+    if image_context:
+        content_parts.append(image_context)
 
     try:
         model = genai.GenerativeModel(model_name, system_instruction=system_instruction)
+        
+        # We use generate_content with the list of history + new content
+        # Note: For multimodal with history, we append the new complex part
+        # Gemini Python SDK handles list of parts well
+        
+        # If we have history, we might need to use chat session, 
+        # but chat session with images can be tricky in some SDK versions.
+        # Simplest Monolith approach: Send full history as list of contents
+        
         full_conversation = gemini_history + [{"role": "user", "parts": content_parts}]
 
         response = model.generate_content(
@@ -210,22 +216,11 @@ def generate_response(user_input, text_context=None, image_context=None, audio_c
             if st.session_state.risk_budget[k] <= 0:
                 depleted.append(k)
         
-        # Save History
-        user_log = user_input if user_input else "[Audio Input]"
-        st.session_state.history.append({"role": "user", "parts": [user_log]})
+        # Save to history (Text only to keep DB light)
+        st.session_state.history.append({"role": "user", "parts": [final_text_prompt]})
         st.session_state.history.append({"role": "model", "parts": [raw_text]})
 
         footer = f"\n\n---\nRunning Risk Budget: {st.session_state.risk_budget}"
-        
-        # TTS GENERATION
-        try:
-            tts = gTTS(text=raw_text[:500], lang='en')
-            tts_fp = io.BytesIO()
-            tts.write_to_fp(tts_fp)
-            st.session_state.last_audio = tts_fp
-        except:
-            pass
-
         if depleted:
              return f"⚠️ BUDGET WARNING: {depleted}\n\n" + raw_text + footer
         return raw_text + footer
@@ -246,55 +241,80 @@ with st.sidebar:
         st.session_state.session_id = new_id
         st.rerun()
 
-    # --- ARTIFACTS ---
+    # --- ARTIFACT INGESTION (PDF/IMG/TXT) ---
     st.write("---")
     st.subheader("📂 Ingest Artifact")
-    uploaded_file = st.file_uploader("Upload", type=['txt', 'md', 'pdf', 'png', 'jpg'])
+    uploaded_file = st.file_uploader("Upload Artifact", type=['txt', 'md', 'py', 'json', 'csv', 'pdf', 'png', 'jpg', 'jpeg'])
     
     context_text = None
     context_image = None
     
-    if uploaded_file:
+    if uploaded_file is not None:
         try:
+            # IMAGE HANDLING
             if uploaded_file.type.startswith("image/"):
                 context_image = Image.open(uploaded_file)
-                st.image(context_image, caption="Vision Active", use_container_width=True)
+                st.image(context_image, caption="Vision Context Active", use_container_width=True)
+            
+            # PDF HANDLING
             elif uploaded_file.type == "application/pdf":
                 reader = pypdf.PdfReader(uploaded_file)
-                # Limit pages to prevent crash
-                context_text = "".join([p.extract_text() for p in reader.pages[:50]])
-                st.success(f"PDF Loaded.")
+                pdf_text = ""
+                for page in reader.pages:
+                    pdf_text += page.extract_text() + "\n"
+                context_text = pdf_text
+                st.success(f"PDF Loaded: {len(pdf_text)} chars")
+            
+            # TEXT HANDLING
             else:
                 stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
                 context_text = stringio.read()
-                st.success(f"Text Loaded.")
+                st.success(f"Text Loaded: {len(context_text)} chars")
+                
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Read Error: {e}")
 
     # History
     st.write("---")
     st.subheader("📜 History")
-    recent_sessions = get_recent_sessions(5)
+    recent_sessions = get_recent_sessions(10)
+    
+    if not recent_sessions:
+        st.caption("No history yet.")
+    
     for s_id, updated_at, data_str in recent_sessions:
-        if st.button(f"Session {s_id}", key=f"hist_{s_id}"):
+        data = json.loads(data_str)
+        try:
+            dt_obj = datetime.fromisoformat(updated_at)
+            time_str = dt_obj.strftime("%d %b %H:%M")
+        except:
+            time_str = "??"
+        mode_label = data.get("mode", "Setup") or "Setup"
+        label = f"{mode_label} ({time_str})"
+        btype = "primary" if s_id == st.session_state.session_id else "secondary"
+        
+        if st.button(label, key=f"hist_{s_id}", type=btype, use_container_width=True):
             st.query_params["session_id"] = s_id
             st.rerun()
 
     if st.session_state.step == "active":
         if st.button("Renew Budget"):
             st.session_state.risk_budget = {k: 10 for k in st.session_state.risk_budget}
+            st.session_state.messages.append({"role": "assistant", "content": "ADMIN: Risk Budget Replenished."})
             sync_state()
             st.rerun()
 
+    if st.button("🗑️ Wipe All History"):
+        clear_db()
+        st.rerun()
+
 # --- MAIN UI ---
 st.markdown("<h1 style='text-align: center;'>🧠 OECS Cloud</h1>", unsafe_allow_html=True)
-
-# Initialize audio_val safely
-audio_val = None
+st.caption("Open Epistemic Co-Creation System | Lusaka, Zambia 🇿🇲")
 
 # STATE MACHINE
 if st.session_state.step == "mode_selection":
-    st.info("Select Epistemic Mode:")
+    st.info("Select Epistemic Mode to begin:")
     options = ["DIAGNOSTIC", "OPEN_EPISTEMIC", "CO_CREATION", "SIMULATION", "CONSENSUS_SAFE"]
     choice = st.selectbox("Mode:", options, index=1)
     if st.button("Initialize"):
@@ -305,60 +325,51 @@ if st.session_state.step == "mode_selection":
         st.rerun()
 
 elif st.session_state.step == "active":
-    # Show mic only in active mode
-    audio_val = st.audio_input("🎤 Voice Command")
+    if any(v <= 0 for v in st.session_state.risk_budget.values()):
+        st.warning("Risk Budget Depleted. Type 'RENEW' or use Sidebar.")
 
-# DISPLAY CHAT
+# DISPLAY
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# AUDIO PLAYBACK
-if "last_audio" in st.session_state and st.session_state.last_audio:
-    st.audio(st.session_state.last_audio, format="audio/mp3", autoplay=True)
-    del st.session_state.last_audio 
-
-# INPUT HANDLING
-prompt = st.chat_input("Input...")
-
-if prompt or audio_val:
-    user_content = prompt if prompt else "[Audio Message]"
-    st.session_state.messages.append({"role": "user", "content": user_content})
+# INPUT
+if prompt := st.chat_input("Input..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
-        st.markdown(user_content)
+        st.markdown(prompt)
 
     response = ""
-    audio_bytes = audio_val.read() if audio_val else None
-
-    # Logic Handlers...
+    
     if st.session_state.step == "contract":
-        if prompt and "ACCEPT" in prompt.upper():
+        expected = f"ACCEPT {st.session_state.mode}"
+        if prompt.upper().strip() == expected:
             st.session_state.step = "risk_budget"
             response = "Allocated Budget (0-10).\nFormat: 1:10, 2:10, 3:10, 4:10"
         else:
-            response = "Please type ACCEPT [MODE]"
+            response = f"Please type exactly: {expected}"
 
     elif st.session_state.step == "risk_budget":
-        if prompt:
-            matches = re.findall(r"\d+:\s*(\d+)", prompt)
-            if len(matches) == 4:
-                vals = [int(v) for v in matches]
-                keys = ["epistemic_uncertainty", "metaphysical_abstraction", "non_consensus_reasoning", "paradox_exposure"]
-                st.session_state.risk_budget = dict(zip(keys, vals))
-                st.session_state.step = "active"
-                response = f"Handshake Complete. System Active."
-            else:
-                response = "Invalid format."
+        matches = re.findall(r"\d+:\s*(\d+)", prompt)
+        if len(matches) == 4:
+            vals = [int(v) for v in matches]
+            keys = ["epistemic_uncertainty", "metaphysical_abstraction", "non_consensus_reasoning", "paradox_exposure"]
+            st.session_state.risk_budget = dict(zip(keys, vals))
+            st.session_state.step = "active"
+            response = f"Handshake Complete. Mode: {st.session_state.mode}. System Active."
+        else:
+            response = "Invalid format. Try: '1:10 2:10 3:10 4:10'"
 
     elif st.session_state.step == "active":
-        if prompt and prompt.strip().upper() == "RENEW":
+        if prompt.strip().upper() == "RENEW":
              st.session_state.risk_budget = {k: 10 for k in st.session_state.risk_budget}
-             response = "ADMIN: Risk Budget Replenished."
+             response = "ADMIN: Risk Budget Replenished to 10/10."
         elif any(v <= 0 for v in st.session_state.risk_budget.values()):
-            response = "Budget Depleted. Type 'RENEW'."
+            response = "Budget Depleted. Type 'RENEW' to continue."
         else:
-            with st.spinner("Processing..."):
-                response = generate_response(prompt, context_text, context_image, audio_bytes)
+            with st.spinner(f"Processing ({model_name})..."):
+                # PASS TEXT AND IMAGE CONTEXT
+                response = generate_response(prompt, context_text, context_image)
     
     st.session_state.messages.append({"role": "assistant", "content": response})
     sync_state()
