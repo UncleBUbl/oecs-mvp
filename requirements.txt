@@ -8,3 +8,4 @@ streamlit
 pypdf
 Pillow
 requests
+gTTS
