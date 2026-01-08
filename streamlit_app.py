@@ -13,6 +13,80 @@ import pypdf
 # 1. PAGE CONFIG
 st.set_page_config(page_title="OECS — Lusaka (Cloud)", page_icon="🧠", layout="centered")
 
+# --- CUSTOM CSS (THE MATRIX / ORACLE THEME) ---
+st.markdown("""
+<style>
+    /* IMPORT TERMINAL FONT */
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+
+    /* GLOBAL STYLES */
+    .stApp {
+        background-color: #050505;
+        font-family: 'JetBrains Mono', monospace;
+        color: #e0e0e0;
+    }
+
+    /* HEADERS */
+    h1, h2, h3 {
+        color: #00ff41 !important; /* Matrix Green */
+        text-transform: uppercase;
+        letter-spacing: 2px;
+    }
+    
+    /* SIDEBAR */
+    [data-testid="stSidebar"] {
+        background-color: #0a0a0a;
+        border-right: 1px solid #333;
+    }
+    
+    /* BUTTONS */
+    .stButton>button {
+        background-color: #000;
+        color: #00ff41;
+        border: 1px solid #00ff41;
+        border-radius: 4px;
+        transition: all 0.3s ease;
+        text-transform: uppercase;
+        font-weight: bold;
+    }
+    .stButton>button:hover {
+        background-color: #00ff41;
+        color: #000;
+        box-shadow: 0 0 15px rgba(0, 255, 65, 0.5);
+    }
+
+    /* CHAT BUBBLES */
+    [data-testid="stChatMessage"] {
+        background-color: #111;
+        border: 1px solid #333;
+        border-radius: 8px;
+        font-family: 'JetBrains Mono', monospace;
+    }
+    /* User Bubble Accent */
+    [data-testid="stChatMessage"][data-testid="user"] {
+        border-left: 3px solid #00ff41;
+    }
+    /* AI Bubble Accent */
+    [data-testid="stChatMessage"][data-testid="assistant"] {
+        border-left: 3px solid #d4af37; /* Gold for the Oracle */
+    }
+
+    /* INPUT BOX */
+    .stTextInput>div>div>input {
+        background-color: #111;
+        color: #00ff41;
+        border: 1px solid #333;
+    }
+    
+    /* ALERTS/WARNINGS */
+    .stAlert {
+        background-color: #220000;
+        border: 1px solid #ff0000;
+        color: #ffcccc;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # --- PERSISTENCE LAYER (SQLite) ---
 DB_FILE = "oecs_sessions.db"
 
@@ -170,7 +244,6 @@ def generate_response(user_input, text_context=None, image_context=None):
     # 1. Rebuild History for Gemini
     gemini_history = []
     for msg in st.session_state.history:
-        # We assume history contains text only to save tokens/complexity
         gemini_history.append({"role": msg["role"], "parts": msg["parts"]})
     
     # 2. Construct Current Turn Content
@@ -188,14 +261,6 @@ def generate_response(user_input, text_context=None, image_context=None):
 
     try:
         model = genai.GenerativeModel(model_name, system_instruction=system_instruction)
-        
-        # We use generate_content with the list of history + new content
-        # Note: For multimodal with history, we append the new complex part
-        # Gemini Python SDK handles list of parts well
-        
-        # If we have history, we might need to use chat session, 
-        # but chat session with images can be tricky in some SDK versions.
-        # Simplest Monolith approach: Send full history as list of contents
         
         full_conversation = gemini_history + [{"role": "user", "parts": content_parts}]
 
@@ -216,7 +281,7 @@ def generate_response(user_input, text_context=None, image_context=None):
             if st.session_state.risk_budget[k] <= 0:
                 depleted.append(k)
         
-        # Save to history (Text only to keep DB light)
+        # Save to history
         st.session_state.history.append({"role": "user", "parts": [final_text_prompt]})
         st.session_state.history.append({"role": "model", "parts": [raw_text]})
 
